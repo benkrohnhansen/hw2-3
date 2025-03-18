@@ -20,8 +20,18 @@ typedef struct particle_t {
     double ay; // Acceleration Y
 } particle_t;
 
+extern int num_cells_x, num_cells_y;
+extern int* d_cell_starts;
+extern int* d_cell_ends;
+extern particle_t* d_ghost_particles;
+extern int* d_ghost_counts;
+
+
+
 // Simulation routine
 void init_simulation(particle_t* parts, int num_parts, double size);
 void simulate_one_step(particle_t* parts, int num_parts, double size);
+extern __global__ void compute_forces_with_ghosts(particle_t* parts, int num_parts, particle_t* ghost_particles, int* ghost_counts);
+
 
 #endif
