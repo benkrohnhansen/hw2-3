@@ -1,4 +1,3 @@
-// gpu.cu
 #include "common.h"
 #include <cuda.h>
 #include <cmath>
