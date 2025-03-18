@@ -41,6 +41,16 @@ __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor) {
 }
 
 // ---------------------------------------------------------------------
+// Kernel: Clear particle accelerations (set ax and ay to zero).
+__global__ void clear_accelerations(particle_t* particles, int num_parts) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_parts) {
+        particles[idx].ax = 0;
+        particles[idx].ay = 0;
+    }
+}
+
+// ---------------------------------------------------------------------
 // Kernel: Compute forces between particles in each cell and the 8 neighboring cells.
 __global__ void compute_forces_gpu(particle_t* particles, int num_parts,
                                    int* cell_starts, int* cell_ends,
@@ -152,4 +162,151 @@ __global__ void count_particles_kernel(particle_t* particles, int num_parts,
         cell_x = (cell_x < 0) ? 0 : (cell_x >= num_cells_x ? num_cells_x - 1 : cell_x);
         cell_y = (cell_y < 0) ? 0 : (cell_y >= num_cells_y ? num_cells_y - 1 : cell_y);
         int cell_id = cell_x + cell_y * num_cells_x;
-        atomicAdd(&cell_counts[cell
+        atomicAdd(&cell_counts[cell_id], 1);
+    }
+}
+
+// Kernel: Scatter particles into a sorted array (sorted by cell).
+__global__ void scatter_particles_kernel(particle_t* particles, int num_parts,
+                                           int num_cells_x, int num_cells_y,
+                                           double cell_size, int* cell_offsets,
+                                           particle_t* particles_sorted) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < num_parts) {
+        particle_t p = particles[idx];
+        int cell_x = (int)(p.x / cell_size);
+        int cell_y = (int)(p.y / cell_size);
+        cell_x = (cell_x < 0) ? 0 : (cell_x >= num_cells_x ? num_cells_x - 1 : cell_x);
+        cell_y = (cell_y < 0) ? 0 : (cell_y >= num_cells_y ? num_cells_y - 1 : cell_y);
+        int cell_id = cell_x + cell_y * num_cells_x;
+        int pos = atomicAdd(&cell_offsets[cell_id], 1);
+        particles_sorted[pos] = p;
+    }
+}
+
+// Kernel: Update cell_ends based on cell_starts and counts.
+__global__ void update_cell_ends_kernel(int total_cells,
+                                          int* cell_starts,
+                                          int* cell_counts,
+                                          int* cell_ends) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < total_cells)
+        cell_ends[idx] = cell_starts[idx] + cell_counts[idx];
+}
+
+// ---------------------------------------------------------------------
+// Rebinning host function.
+// This function clears counts, counts particles per cell,
+// computes an exclusive scan (to get cell_starts), scatters particles,
+// updates cell_ends, and then copies the sorted array back.
+void rebin_particles(particle_t* particles, int num_parts, double cell_size,
+                     int num_cells_x, int num_cells_y) {
+    int total_cells = num_cells_x * num_cells_y;
+    int threads = 256;
+    int blocks = (total_cells + threads - 1) / threads;
+
+    // Clear the cell_counts array.
+    clear_cell_counts<<<blocks, threads>>>(d_cell_counts, total_cells);
+    cudaDeviceSynchronize();
+    
+    // Count particles in each cell.
+    blocks = (num_parts + threads - 1) / threads;
+    count_particles_kernel<<<blocks, threads>>>(particles, num_parts,
+                                                  num_cells_x, num_cells_y,
+                                                  cell_size, d_cell_counts);
+    cudaDeviceSynchronize();
+    
+    // Perform an exclusive scan on cell_counts to compute cell_starts.
+    thrust::device_ptr<int> counts_ptr(d_cell_counts);
+    thrust::device_ptr<int> starts_ptr(d_cell_starts);
+    thrust::exclusive_scan(counts_ptr, counts_ptr + total_cells, starts_ptr);
+    
+    // Copy cell_starts into a working array for scattering.
+    cudaMemcpy(d_cell_offsets, d_cell_starts, total_cells * sizeof(int),
+               cudaMemcpyDeviceToDevice);
+    
+    // Scatter particles into the sorted array.
+    blocks = (num_parts + threads - 1) / threads;
+    scatter_particles_kernel<<<blocks, threads>>>(particles, num_parts,
+                                                    num_cells_x, num_cells_y,
+                                                    cell_size, d_cell_offsets,
+                                                    d_particles_sorted);
+    cudaDeviceSynchronize();
+    
+    // Update cell_ends.
+    blocks = (total_cells + threads - 1) / threads;
+    update_cell_ends_kernel<<<blocks, threads>>>(total_cells, d_cell_starts,
+                                                 d_cell_counts, d_cell_ends);
+    cudaDeviceSynchronize();
+    
+    // Copy the sorted particles back into the main array.
+    cudaMemcpy(particles, d_particles_sorted, num_parts * sizeof(particle_t),
+               cudaMemcpyDeviceToDevice);
+}
+
+// ---------------------------------------------------------------------
+// Initialization function.
+// This function is called once (before simulation begins) and sets up the
+// cell grid arrays as well as ghost-particle storage.
+void init_simulation(particle_t* parts, int num_parts, double size) {
+    // Determine the number of blocks for 1D kernels.
+    blks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
+    
+    // Set up the cell grid dimensions.
+    num_cells_x = (int)(size / CELL_SIZE);
+    num_cells_y = (int)(size / CELL_SIZE);
+    int total_cells = num_cells_x * num_cells_y;
+    
+    // Allocate memory for cell arrays.
+    cudaMalloc((void**)&d_cell_starts, total_cells * sizeof(int));
+    cudaMalloc((void**)&d_cell_ends, total_cells * sizeof(int));
+    cudaMalloc((void**)&d_cell_counts, total_cells * sizeof(int));
+    cudaMalloc((void**)&d_cell_offsets, total_cells * sizeof(int));
+    cudaMalloc((void**)&d_particles_sorted, num_parts * sizeof(particle_t));
+    
+    // Allocate ghost particle arrays.
+    cudaMalloc((void**)&d_ghost_particles, num_parts * sizeof(particle_t));
+    // Allocate ghost count as a single integer.
+    cudaMalloc((void**)&d_ghost_count, sizeof(int));
+    cudaMemset(d_ghost_count, 0, sizeof(int));
+    
+    // Initialize cell_counts to zero.
+    cudaMemset(d_cell_counts, 0, total_cells * sizeof(int));
+}
+
+// ---------------------------------------------------------------------
+// Simulation step: rebin particles, clear accelerations, compute forces,
+// move particles, and compute ghost forces.
+void simulate_one_step(particle_t* parts, int num_parts, double size) {
+    // Rebin particles: update cell arrays based on current particle positions.
+    rebin_particles(parts, num_parts, CELL_SIZE, num_cells_x, num_cells_y);
+    
+    // Clear accelerations for all particles before computing forces.
+    int threads = 256;
+    int blocks = (num_parts + threads - 1) / threads;
+    clear_accelerations<<<blocks, threads>>>(parts, num_parts);
+    cudaDeviceSynchronize();
+    
+    // Set up a 2D grid for the force and move kernels.
+    dim3 blockDim(16, 16);
+    dim3 gridDim((num_cells_x + blockDim.x - 1) / blockDim.x,
+                 (num_cells_y + blockDim.y - 1) / blockDim.y);
+    
+    // Compute forces among particles using the sorted array and cell arrays.
+    compute_forces_gpu<<<gridDim, blockDim>>>(parts, num_parts, d_cell_starts,
+                                                d_cell_ends, num_cells_x, num_cells_y);
+    cudaDeviceSynchronize();
+    
+    // Reset ghost count for the current simulation step.
+    cudaMemset(d_ghost_count, 0, sizeof(int));
+    
+    // Move particles (and record any that still lie outside the domain).
+    move_gpu<<<gridDim, blockDim>>>(parts, num_parts, size,
+                                    d_ghost_particles, d_ghost_count);
+    cudaDeviceSynchronize();
+    
+    // Compute additional forces from ghost particles.
+    compute_forces_with_ghosts<<<gridDim, blockDim>>>(parts, num_parts,
+                                                      d_ghost_particles, d_ghost_count);
+    cudaDeviceSynchronize();
+}
