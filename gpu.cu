@@ -20,11 +20,10 @@ int* d_cell_offsets;   // working copy of cell_starts for scattering
 // Temporary sorted particle array (by cell).
 particle_t* d_particles_sorted;
 
-// Ghost particles and ghost counts.
-// (Note: ghost_counts now is allocated based on the x-dimension of the 2D grid 
-// used in move_gpu and ghost-force kernels so that indexing (blockIdx.x) is valid.)
+// Ghost particles and ghost count.
+// NOTE: Instead of an array of ghost counts (indexed per block), we now use a single counter.
 particle_t* d_ghost_particles;
-int* d_ghost_counts;
+int* d_ghost_count;  // single integer (allocated as a device pointer)
 
 // ---------------------------------------------------------------------
 // Device function: Compute and apply force between two particles.
@@ -82,13 +81,13 @@ __global__ void compute_forces_gpu(particle_t* particles, int num_parts,
 // Kernel: Compute additional forces using ghost particles.
 __global__ void compute_forces_with_ghosts(particle_t* parts, int num_parts,
                                              particle_t* ghost_particles,
-                                             int* ghost_counts) {
+                                             int* ghost_count) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_parts)
         return;
     particle_t& p = parts[tid];
-    // Use ghost particles from the current block (if any).
-    int count = ghost_counts[blockIdx.x];  // note: only blockIdx.x is used
+    // Use the global ghost count.
+    int count = *ghost_count;
     for (int i = 0; i < count; i++) {
         apply_force_gpu(p, ghost_particles[i]);
     }
@@ -98,7 +97,7 @@ __global__ void compute_forces_with_ghosts(particle_t* parts, int num_parts,
 // Kernel: Move particles using Velocity Verlet integration.
 // If a particle leaves the domain, record it as a ghost particle.
 __global__ void move_gpu(particle_t* particles, int num_parts, double size,
-                           particle_t* ghost_particles, int* ghost_counts) {
+                           particle_t* ghost_particles, int* ghost_count) {
     // Compute a unique thread id from 2D grid.
     int tx = threadIdx.x + blockIdx.x * blockDim.x;
     int ty = threadIdx.y + blockIdx.y * blockDim.y;
@@ -125,7 +124,7 @@ __global__ void move_gpu(particle_t* particles, int num_parts, double size,
 
     // If still outside the domain, record as a ghost particle.
     if (p->x < 0 || p->x > size || p->y < 0 || p->y > size) {
-        int idx = atomicAdd(&ghost_counts[blockIdx.x], 1);
+        int idx = atomicAdd(ghost_count, 1);
         ghost_particles[idx] = *p;
     }
 }
@@ -153,146 +152,4 @@ __global__ void count_particles_kernel(particle_t* particles, int num_parts,
         cell_x = (cell_x < 0) ? 0 : (cell_x >= num_cells_x ? num_cells_x - 1 : cell_x);
         cell_y = (cell_y < 0) ? 0 : (cell_y >= num_cells_y ? num_cells_y - 1 : cell_y);
         int cell_id = cell_x + cell_y * num_cells_x;
-        atomicAdd(&cell_counts[cell_id], 1);
-    }
-}
-
-// Kernel: Scatter particles into a sorted array (sorted by cell).
-__global__ void scatter_particles_kernel(particle_t* particles, int num_parts,
-                                           int num_cells_x, int num_cells_y,
-                                           double cell_size, int* cell_offsets,
-                                           particle_t* particles_sorted) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < num_parts) {
-        particle_t p = particles[idx];
-        int cell_x = (int)(p.x / cell_size);
-        int cell_y = (int)(p.y / cell_size);
-        cell_x = (cell_x < 0) ? 0 : (cell_x >= num_cells_x ? num_cells_x - 1 : cell_x);
-        cell_y = (cell_y < 0) ? 0 : (cell_y >= num_cells_y ? num_cells_y - 1 : cell_y);
-        int cell_id = cell_x + cell_y * num_cells_x;
-        int pos = atomicAdd(&cell_offsets[cell_id], 1);
-        particles_sorted[pos] = p;
-    }
-}
-
-// Kernel: Update cell_ends based on cell_starts and counts.
-__global__ void update_cell_ends_kernel(int total_cells,
-                                          int* cell_starts,
-                                          int* cell_counts,
-                                          int* cell_ends) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < total_cells)
-        cell_ends[idx] = cell_starts[idx] + cell_counts[idx];
-}
-
-// ---------------------------------------------------------------------
-// Rebinning host function.
-// This function clears counts, counts particles per cell,
-// computes an exclusive scan (to get cell_starts), scatters particles,
-// updates cell_ends, and then copies the sorted array back.
-void rebin_particles(particle_t* particles, int num_parts, double cell_size,
-                     int num_cells_x, int num_cells_y) {
-    int total_cells = num_cells_x * num_cells_y;
-    int threads = 256;
-    int blocks = (total_cells + threads - 1) / threads;
-
-    // Clear the cell_counts array.
-    clear_cell_counts<<<blocks, threads>>>(d_cell_counts, total_cells);
-    cudaDeviceSynchronize();
-    
-    // Count particles in each cell.
-    blocks = (num_parts + threads - 1) / threads;
-    count_particles_kernel<<<blocks, threads>>>(particles, num_parts,
-                                                  num_cells_x, num_cells_y,
-                                                  cell_size, d_cell_counts);
-    cudaDeviceSynchronize();
-    
-    // Perform an exclusive scan on cell_counts to compute cell_starts.
-    thrust::device_ptr<int> counts_ptr(d_cell_counts);
-    thrust::device_ptr<int> starts_ptr(d_cell_starts);
-    thrust::exclusive_scan(counts_ptr, counts_ptr + total_cells, starts_ptr);
-    
-    // Copy cell_starts into a working array for scattering.
-    cudaMemcpy(d_cell_offsets, d_cell_starts, total_cells * sizeof(int),
-               cudaMemcpyDeviceToDevice);
-    
-    // Scatter particles into the sorted array.
-    blocks = (num_parts + threads - 1) / threads;
-    scatter_particles_kernel<<<blocks, threads>>>(particles, num_parts,
-                                                    num_cells_x, num_cells_y,
-                                                    cell_size, d_cell_offsets,
-                                                    d_particles_sorted);
-    cudaDeviceSynchronize();
-    
-    // Update cell_ends.
-    blocks = (total_cells + threads - 1) / threads;
-    update_cell_ends_kernel<<<blocks, threads>>>(total_cells, d_cell_starts,
-                                                 d_cell_counts, d_cell_ends);
-    cudaDeviceSynchronize();
-    
-    // Copy the sorted particles back into the main array.
-    cudaMemcpy(particles, d_particles_sorted, num_parts * sizeof(particle_t),
-               cudaMemcpyDeviceToDevice);
-}
-
-// ---------------------------------------------------------------------
-// Initialization function.
-// This function is called once (before simulation begins) and sets up the
-// cell grid arrays as well as ghost-particle storage.
-void init_simulation(particle_t* parts, int num_parts, double size) {
-    // Determine the number of blocks for 1D kernels.
-    blks = (num_parts + NUM_THREADS - 1) / NUM_THREADS;
-    
-    // Set up the cell grid dimensions.
-    num_cells_x = (int)(size / CELL_SIZE);
-    num_cells_y = (int)(size / CELL_SIZE);
-    int total_cells = num_cells_x * num_cells_y;
-    
-    // Allocate memory for cell arrays.
-    cudaMalloc((void**)&d_cell_starts, total_cells * sizeof(int));
-    cudaMalloc((void**)&d_cell_ends, total_cells * sizeof(int));
-    cudaMalloc((void**)&d_cell_counts, total_cells * sizeof(int));
-    cudaMalloc((void**)&d_cell_offsets, total_cells * sizeof(int));
-    cudaMalloc((void**)&d_particles_sorted, num_parts * sizeof(particle_t));
-    
-    // Allocate ghost particle arrays.
-    cudaMalloc((void**)&d_ghost_particles, num_parts * sizeof(particle_t));
-    // Allocate ghost_counts based on the x-dimension of the grid we will use
-    int ghost_num_blocks = (num_cells_x + 16 - 1) / 16;
-    cudaMalloc((void**)&d_ghost_counts, ghost_num_blocks * sizeof(int));
-    cudaMemset(d_ghost_counts, 0, ghost_num_blocks * sizeof(int));
-    
-    // Initialize cell_counts to zero.
-    cudaMemset(d_cell_counts, 0, total_cells * sizeof(int));
-}
-
-// ---------------------------------------------------------------------
-// Simulation step: rebin particles, compute forces, move particles, and compute ghost forces.
-void simulate_one_step(particle_t* parts, int num_parts, double size) {
-    // Rebin particles: update cell arrays based on current particle positions.
-    rebin_particles(parts, num_parts, CELL_SIZE, num_cells_x, num_cells_y);
-    
-    // Set up a 2D grid for the force and move kernels.
-    dim3 blockDim(16, 16);
-    dim3 gridDim((num_cells_x + blockDim.x - 1) / blockDim.x,
-                 (num_cells_y + blockDim.y - 1) / blockDim.y);
-    
-    // Compute forces among particles using the sorted array and cell arrays.
-    compute_forces_gpu<<<gridDim, blockDim>>>(parts, num_parts, d_cell_starts,
-                                                d_cell_ends, num_cells_x, num_cells_y);
-    cudaDeviceSynchronize();
-    
-    // Reset ghost_counts for the current simulation step.
-    int ghost_num_blocks = (num_cells_x + 16 - 1) / 16;
-    cudaMemset(d_ghost_counts, 0, ghost_num_blocks * sizeof(int));
-    
-    // Move particles (and record any that still lie outside the domain).
-    move_gpu<<<gridDim, blockDim>>>(parts, num_parts, size,
-                                    d_ghost_particles, d_ghost_counts);
-    cudaDeviceSynchronize();
-    
-    // Compute additional forces from ghost particles.
-    compute_forces_with_ghosts<<<gridDim, blockDim>>>(parts, num_parts,
-                                                      d_ghost_particles, d_ghost_counts);
-    cudaDeviceSynchronize();
-}
+        atomicAdd(&cell_counts[cell
