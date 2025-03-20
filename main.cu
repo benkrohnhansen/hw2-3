@@ -121,14 +121,20 @@ int main(int argc, char** argv) {
     cudaMalloc((void**)&parts_gpu, num_parts * sizeof(particle_t));
     cudaMemcpy(parts_gpu, parts, num_parts * sizeof(particle_t), cudaMemcpyHostToDevice);
 
+    double comp_time = 0.0, thrust_time = 0.0;
+    double synch_time = 0.0;
     // Algorithm
     auto start_time = std::chrono::steady_clock::now();
 
     init_simulation(parts_gpu, num_parts, size);
 
     for (int step = 0; step < nsteps; ++step) {
-        simulate_one_step(parts_gpu, num_parts, size);
+        simulate_one_step(parts_gpu, num_parts, size, comp_time, thrust_time);
+	auto start_synch = std::chrono::steady_clock::now();
         cudaDeviceSynchronize();
+	auto end_synch = std::chrono::steady_clock::now();
+	std::chrono::duration<double> synch_diff = start_synch - end_synch;
+        synch_time += synch_diff.count();
 
         // Save state if necessary
         if (fsave.good() && (step % savefreq) == 0) {
@@ -145,6 +151,10 @@ int main(int argc, char** argv) {
 
     // Finalize
     std::cout << "Simulation Time = " << seconds << " seconds for " << num_parts << " particles.\n";
+    std::cout << "Computation Time = " << comp_time/1000 << "\n";
+    std::cout << "Thrust Op. Time = " << thrust_time/1000 << "\n";
+    std::cout << "Synchronization Time = " << -synch_time << "\n";
+    std::cout << "====================\n";
     fsave.close();
     cudaFree(parts_gpu);
     delete[] parts;

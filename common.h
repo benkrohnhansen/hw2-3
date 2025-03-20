@@ -22,7 +22,7 @@ typedef struct particle_t {
 
 // Simulation routine
 void init_simulation(particle_t* parts, int num_parts, double size);
-void simulate_one_step(particle_t* parts, int num_parts, double size);
+void simulate_one_step(particle_t* parts, int num_parts, double size, double& total_comp_time, double& total_thrust_time);
 __device__ void apply_force_gpu(particle_t& particle, particle_t& neighbor);
 
 

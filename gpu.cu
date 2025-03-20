@@ -115,7 +115,19 @@ void init_simulation(particle_t* parts, int num_parts, double size) {
     num_bins_y = static_cast<int>(ceil(size / bin_size));
 }
 
-void simulate_one_step(particle_t* parts, int num_parts, double size) {
+void simulate_one_step(particle_t* parts, int num_parts, double size,
+		       double& total_comp_time, double& total_thrust_time) {
+    cudaEvent_t start_thrust, stop_thrust, start_compute, stop_compute;
+    float time_thrust = 0.0f, time_compute = 0.0f;
+
+    cudaEventCreate(&start_thrust);
+    cudaEventCreate(&stop_thrust);
+    cudaEventCreate(&start_compute);
+    cudaEventCreate(&stop_compute);
+
+    // ======== START THRUST TIMING =========
+    cudaEventRecord(start_thrust, 0);
+
     static thrust::device_vector<int> parts_per_bin(num_bins_x * num_bins_y);
     thrust::fill(parts_per_bin.begin(), parts_per_bin.end(), 0);
     compute_parts_per_bin<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>(
@@ -128,7 +140,18 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
 
     static thrust::device_vector<int> sorted_parts(num_parts);
     static thrust::device_vector<int> bin_positions(num_bins_x * num_bins_y);
-    assign_parts_to_bins<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>(
+ 
+    //=========== STOP THRUST TIMING ========= 
+    cudaEventRecord(stop_thrust, 0); 
+    cudaEventSynchronize(stop_thrust);
+    cudaEventElapsedTime(&time_thrust, start_thrust, stop_thrust);
+
+    total_thrust_time += time_thrust;
+
+    //========== START COMPUTE TIMING ========
+    cudaEventRecord(start_compute, 0);
+
+   assign_parts_to_bins<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>(
         parts, num_parts, thrust::raw_pointer_cast(sorted_parts.data()), thrust::raw_pointer_cast(bin_offsets.data()), num_bins_x, num_bins_y);
 
     dim3 blockDim(16, 16);
@@ -139,6 +162,18 @@ void simulate_one_step(particle_t* parts, int num_parts, double size) {
         parts, num_parts, thrust::raw_pointer_cast(sorted_parts.data()), thrust::raw_pointer_cast(bin_offsets.data()), num_bins_x, num_bins_y);
 
     move_gpu<<<(num_parts + NUM_THREADS - 1) / NUM_THREADS, NUM_THREADS>>>(parts, num_parts, size);
+
+    //========== STOP COMPUTE TIMING =========
+    cudaEventRecord(stop_compute, 0);
+    cudaEventSynchronize(stop_compute);
+    cudaEventElapsedTime(&time_compute, start_compute, stop_compute);
+
+    total_comp_time += time_compute;
+
+    cudaEventDestroy(start_thrust);
+    cudaEventDestroy(stop_thrust);
+    cudaEventDestroy(start_compute);
+    cudaEventDestroy(stop_compute);
 }
 
 
